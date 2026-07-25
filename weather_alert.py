@@ -2,27 +2,24 @@
 """
 weather_alert.py
 
-Checks tomorrow's forecast for River Falls, Wisconsin using the Open-Meteo
-Forecast API (no API key required) and sends a Discord webhook message when
-notable weather is expected.
+Sends the current actual temperature for River Falls, Wisconsin to Discord
+every time this script runs (intended to run every 20 minutes via GitHub
+Actions), using the Open-Meteo Forecast API (no API key required).
 
-Alert conditions (any one of these triggers an alert):
-  - precipitation probability >= 60% AND rain total >= 0.01 in
-  - snowfall >= 0.1 in
-  - max temperature >= 95 F
-  - min temperature <= 32 F
+Alongside the regular update, a highlighted alert section is appended when
+any of the following conditions are met for tomorrow's forecast:
+- precipitation probability >= 60% AND rain total >= 0.01 in
+- snowfall >= 0.1 in
+- max temperature >= 95 F
+- min temperature <= 32 F
 
-Duplicate alerts for the same forecast date are prevented by recording the
-last alerted forecast date in alert_state.json.
+These no longer control whether a message is sent -- a message is sent on
+every run regardless. They only control whether an "alert" section is added.
 
 Environment variables:
-  DISCORD_WEBHOOK_URL   (required) Discord webhook URL. Never hardcode this.
-  FORCE_ALERT           (optional) If set to "true", sends a test alert using
-                         real forecast data regardless of whether conditions
-                         are met, and does NOT update alert_state.json.
+    DISCORD_WEBHOOK_URL (required) Discord webhook URL. Never hardcode this.
 """
 
-import json
 import os
 import sys
 from datetime import datetime
@@ -35,9 +32,11 @@ import requests
 # ---------------------------------------------------------------------------
 
 LOCATION_NAME = "River Falls, Wisconsin"
+
 # 44 deg 51' 31" N, 92 deg 37' 30" W, converted to decimal degrees.
 LATITUDE = 44.8586
 LONGITUDE = -92.6250
+
 # IANA time zone name corresponding to Central Standard Time.
 TIMEZONE = "America/Chicago"
 
@@ -46,7 +45,8 @@ REQUEST_TIMEOUT_SECONDS = 15
 
 STATE_FILE = Path(__file__).parent / "alert_state.json"
 
-# Alert thresholds
+# Alert thresholds (for the highlighted section only -- they no longer
+# decide whether a message is sent)
 RAIN_PROB_THRESHOLD_PCT = 60
 RAIN_AMOUNT_THRESHOLD_IN = 0.01
 SNOWFALL_THRESHOLD_IN = 0.1
@@ -64,12 +64,21 @@ class WeatherAlertError(Exception):
 
 def fetch_forecast():
     """
-    Requests two days of daily forecast data from Open-Meteo and returns the
-    parsed JSON response. Day index 0 is today, index 1 is tomorrow.
+    Requests current conditions plus two days of daily forecast data from
+    Open-Meteo and returns the parsed JSON response. Daily index 0 is
+    today, index 1 is tomorrow.
     """
     params = {
         "latitude": LATITUDE,
         "longitude": LONGITUDE,
+        "current": ",".join(
+            [
+                "temperature_2m",
+                "apparent_temperature",
+                "relative_humidity_2m",
+                "wind_speed_10m",
+            ]
+        ),
         "daily": ",".join(
             [
                 "precipitation_probability_max",
@@ -80,6 +89,7 @@ def fetch_forecast():
             ]
         ),
         "temperature_unit": "fahrenheit",
+        "wind_speed_unit": "mph",
         "precipitation_unit": "inch",
         "timezone": TIMEZONE,
         "forecast_days": 2,
@@ -110,12 +120,41 @@ def fetch_forecast():
             "Open-Meteo API returned a response that was not valid JSON."
         ) from exc
 
+    if "current" not in data:
+        raise WeatherAlertError(
+            "Open-Meteo API response did not include the expected 'current' data."
+        )
     if "daily" not in data:
         raise WeatherAlertError(
             "Open-Meteo API response did not include the expected 'daily' data."
         )
 
     return data
+
+
+def extract_current(data):
+    """Pulls today's actual current conditions out of the API response."""
+    current = data["current"]
+    required_fields = [
+        "time",
+        "temperature_2m",
+        "apparent_temperature",
+        "relative_humidity_2m",
+        "wind_speed_10m",
+    ]
+    for field in required_fields:
+        if field not in current:
+            raise WeatherAlertError(
+                f"Open-Meteo response is missing expected current field: {field}."
+            )
+
+    return {
+        "time": current["time"],
+        "temp_f": current["temperature_2m"],
+        "feels_like_f": current["apparent_temperature"],
+        "humidity_pct": current["relative_humidity_2m"],
+        "wind_mph": current["wind_speed_10m"],
+    }
 
 
 def extract_tomorrow(daily_data):
@@ -133,7 +172,6 @@ def extract_tomorrow(daily_data):
         "temperature_2m_max",
         "temperature_2m_min",
     ]
-
     for field in required_fields:
         if field not in daily:
             raise WeatherAlertError(
@@ -155,14 +193,14 @@ def extract_tomorrow(daily_data):
 
 
 # ---------------------------------------------------------------------------
-# Alert evaluation
+# Alert evaluation (now only used to decorate the message, not gate it)
 # ---------------------------------------------------------------------------
 
 def evaluate_alert(forecast):
     """
-    Given a tomorrow-forecast dict (see extract_tomorrow), returns a list of
-    human-readable reason strings for any alert conditions that are met.
-    An empty list means no alert is warranted.
+    Given a tomorrow-forecast dict, returns a list of human-readable reason
+    strings for any notable conditions. An empty list just means the
+    regular temperature update goes out with no extra alert section.
     """
     reasons = []
 
@@ -199,57 +237,30 @@ def evaluate_alert(forecast):
 
 
 # ---------------------------------------------------------------------------
-# State handling (duplicate-alert prevention)
-# ---------------------------------------------------------------------------
-
-def load_state():
-    """Loads alert_state.json, tolerating a missing or malformed file."""
-    if not STATE_FILE.exists():
-        return {"last_alert_date": None}
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {"last_alert_date": None}
-
-    if "last_alert_date" not in state:
-        state["last_alert_date"] = None
-
-    return state
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-        f.write("\n")
-
-
-# ---------------------------------------------------------------------------
 # Discord messaging
 # ---------------------------------------------------------------------------
 
-def format_message(forecast, reasons, is_forced_test=False):
+def format_message(current, forecast, reasons):
     date_obj = datetime.strptime(forecast["date"], "%Y-%m-%d")
     friendly_date = date_obj.strftime("%A, %B %d, %Y")
 
-    header = "**Weather Alert**"
-    if is_forced_test:
-        header = "**Weather Alert (TEST / FORCE_ALERT)**"
+    header = "**Weather Update**" if not reasons else "**Weather Update (Alert)**"
 
-    reason_lines = "\n".join(f"- {reason}" for reason in reasons) if reasons else "- (test message, no conditions met)"
+    lines = [
+        header,
+        f"Location: {LOCATION_NAME}",
+        f"Current temperature: {current['temp_f']:.0f} F "
+        f"(feels like {current['feels_like_f']:.0f} F)",
+        f"Humidity: {current['humidity_pct']:.0f}% | Wind: {current['wind_mph']:.0f} mph",
+        f"Tomorrow's high/low ({friendly_date}): "
+        f"{forecast['temp_max_f']:.0f} F / {forecast['temp_min_f']:.0f} F",
+    ]
 
-    message = (
-        f"{header}\n"
-        f"Location: {LOCATION_NAME}\n"
-        f"Forecast date: {friendly_date}\n"
-        f"Reason(s):\n{reason_lines}\n"
-        f"High / Low: {forecast['temp_max_f']:.0f} F / {forecast['temp_min_f']:.0f} F\n"
-        f"Rain probability: {forecast['rain_probability_pct']:.0f}%\n"
-        f"Rain amount: {forecast['rain_amount_in']:.2f} in\n"
-        f"Snow amount: {forecast['snowfall_in']:.2f} in"
-    )
-    return message
+    if reasons:
+        reason_lines = "\n".join(f"- {reason}" for reason in reasons)
+        lines.append(f"Tomorrow's alert(s):\n{reason_lines}")
+
+    return "\n".join(lines)
 
 
 def send_discord_webhook(webhook_url, message):
@@ -291,53 +302,24 @@ def main():
         )
         sys.exit(1)
 
-    force_alert = os.environ.get("FORCE_ALERT", "false").strip().lower() == "true"
-
     try:
         raw_data = fetch_forecast()
+        current = extract_current(raw_data)
         forecast = extract_tomorrow(raw_data)
     except WeatherAlertError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
     reasons = evaluate_alert(forecast)
-    state = load_state()
+    message = format_message(current, forecast, reasons)
 
-    if force_alert:
-        print(
-            f"FORCE_ALERT is enabled. Sending test alert for {forecast['date']} "
-            "using real forecast data. alert_state.json will NOT be modified."
-        )
-        message = format_message(forecast, reasons, is_forced_test=True)
-        try:
-            send_discord_webhook(webhook_url, message)
-        except WeatherAlertError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            sys.exit(1)
-        print("Test alert sent successfully.")
-        return
-
-    if not reasons:
-        print(f"No notable weather for {forecast['date']}. No alert sent.")
-        return
-
-    if state.get("last_alert_date") == forecast["date"]:
-        print(
-            f"Conditions met for {forecast['date']}, but an alert was already "
-            "sent for this forecast date. Skipping to avoid duplicates."
-        )
-        return
-
-    message = format_message(forecast, reasons, is_forced_test=False)
     try:
         send_discord_webhook(webhook_url, message)
     except WeatherAlertError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    state["last_alert_date"] = forecast["date"]
-    save_state(state)
-    print(f"Alert sent and alert_state.json updated for {forecast['date']}.")
+    print(f"Update sent for {current['time']}.")
 
 
 if __name__ == "__main__":
